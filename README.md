@@ -1,181 +1,224 @@
-# smsbridge
-script to work with Huawei HiLink (E3372h) to read and forward sms
+# Huawei HiLink SMS Bridge
 
-Huawei HiLink SMS → Telegram / Email
-Полная инструкция по настройке (Debian, systemd, Python)
-1. Постановка задачи и условия
-Цель
+**Huawei E3372h → Telegram + Email (SMTP) on Debian**
 
-Настроить на Debian-сервере сервис, который:
+## Overview
 
-работает с USB-модемом Huawei HiLink (например E3372h)
+This project provides a **production-ready daemon** that:
 
-мобильные данные на SIM отключены
+* Connects to a **Huawei HiLink USB modem (E3372h and compatible)**
+* Polls the modem **near real-time** for incoming SMS messages
+* Decodes SMS correctly (including **Cyrillic / UCS-2**)
+* Delivers messages to:
 
-модем используется только для приёма SMS
+  * **Telegram chat**
+  * **Email via SMTP (e.g. mail.ru)**
+* Archives processed messages locally
+* **Safely deletes SMS from the modem only after successful delivery**
+* Runs as a hardened **systemd service**
+* Works **without mobile data enabled on the SIM**
+* Ensures the modem **never becomes the default network gateway**
 
-SMS:
+---
 
-читаются почти в реальном времени
+## Design Constraints & Assumptions
 
-корректно декодируются (русский язык)
+### Modem
 
-пересылаются:
+* Huawei **E3372h HiLink** (or similar HiLink firmware)
+* Modem exposes web API at `http://192.168.8.1`
+* SMS storage: **Local (modem)**, not SIM
+* Mobile data **disabled** on SIM (SMS-only usage)
 
-в Telegram
+### Host system
 
-по email (SMTP, mail.ru)
+* Debian (tested on Debian 11/12)
+* NetworkManager enabled
+* systemd available
+* Server may be **remote-only (SSH)** → network misconfiguration must be avoided
 
-сохраняются локально
+### Key Huawei HiLink quirks handled
 
-после успешной доставки удаляются с модема
+* Token expiration (`125002`)
+* Session/token mismatch (`125003`)
+* Token rotation via HTTP headers
+* Additional token endpoint `/api/webserver/token`
+* Reusable SMS `Index` values
+* XML format sensitivity (`100005`)
+* UCS-2 hex encoded SMS
+* UTF-8 mojibake (`ÐÐ¾...`)
 
-Ограничения и особенности Huawei HiLink
+---
 
-Модем работает в HiLink-режиме (RNDIS / CDC Ethernet)
+## Network Configuration (CRITICAL)
 
-Встроенный IP модема: 192.168.8.1
+### Goal
 
-SMS API доступен по HTTP (/api/sms/*)
+The modem **must not**:
 
-Huawei использует:
+* Become the default gateway
+* Provide DNS
+* Break server connectivity after reboot
 
-cookies
+The modem interface is used **only** for local access to `192.168.8.1`.
 
-CSRF-токены (TokInfo)
+---
 
-дополнительные токены (/api/webserver/token)
+### Identify the modem interface
 
-ротацию токенов через HTTP-заголовки
-
-Ошибки:
-
-125002 — token invalid
-
-125003 — session/token error (не фатально, но требует reinit)
-
-100005 — неверный XML (лечится полным schema запроса)
-
-2. Сетевая настройка Debian (КРИТИЧНО)
-Задача
-
-Модем не должен:
-
-становиться default gateway
-
-добавлять DNS
-
-ломать доступ к серверу после reboot
-
-Он нужен только для доступа к 192.168.8.1
-
-2.1 Определение интерфейса модема
+```bash
 ip link
+```
 
+Example:
 
-Обычно выглядит так:
-
+```text
 enx0c5b8f279a64
+```
 
-2.2 Создание NetworkManager-профиля
-sudo nmcli con add type ethernet \
+---
+
+### Create a dedicated NetworkManager connection
+
+```bash
+nmcli con add type ethernet \
   ifname enx0c5b8f279a64 \
   con-name hilink-local \
   ipv4.method manual \
   ipv4.addresses 192.168.8.2/24 \
+  ipv4.gateway "" \
+  ipv4.dns "" \
   ipv6.method disabled
+```
 
-2.3 Ключевые параметры (ОБЯЗАТЕЛЬНО)
-sudo nmcli con modify hilink-local \
+---
+
+### Harden the connection (VERY IMPORTANT)
+
+```bash
+nmcli con modify hilink-local \
+  connection.autoconnect yes \
+  connection.autoconnect-priority -999 \
   ipv4.never-default yes \
   ipv4.ignore-auto-dns yes \
-  ipv4.ignore-auto-routes yes \
-  connection.autoconnect yes \
-  connection.autoconnect-priority -999
+  ipv4.ignore-auto-routes yes
+```
 
+---
 
-⚠️ Это предотвращает потерю сети после reboot
+### Verify routing table
 
-2.4 Проверка
-nmcli con show hilink-local
+```bash
 ip route
+```
 
+You **must** see:
 
-В маршрутах должно быть:
+* Default route via your real LAN interface
+* `192.168.8.0/24` routed only via the modem interface
+* **No default route via the modem**
 
-192.168.8.0/24 dev enx0c5b8f279a64
+---
 
+## Service Architecture
 
-И default route должен оставаться на основном интерфейсе.
+```text
+Huawei Modem (HiLink)
+  ↓ HTTP API
+Debian Server
+  ↓ Python daemon (smsbridge)
+Telegram API
+Email SMTP (mail.ru)
+```
 
-3. Подготовка системы
-3.1 Пользователь сервиса
-sudo useradd -r -s /bin/false -d /var/lib/smsbridge smsbridge
+---
 
-3.2 Каталоги
+## Installation
+
+### 1. Create service user
+
+```bash
+sudo useradd -r -s /usr/sbin/nologin -d /var/lib/smsbridge smsbridge
+```
+
+---
+
+### 2. Create directories
+
+```bash
 sudo mkdir -p /opt/smsbridge /var/lib/smsbridge
 sudo chown smsbridge:smsbridge /var/lib/smsbridge
+```
 
-4. Python virtualenv
+---
+
+### 3. Python virtual environment
+
+```bash
 sudo -u smsbridge python3 -m venv /opt/smsbridge/venv
 sudo -u smsbridge /opt/smsbridge/venv/bin/pip install --upgrade pip
 sudo -u smsbridge /opt/smsbridge/venv/bin/pip install requests
+```
 
-5. Скрипт smsbridge
+---
 
-Финальная версия smsbridge.py:
+### 4. Install `smsbridge.py`
 
-поддерживает:
-
-/api/webserver/SesTokInfo
-
-/api/webserver/token
-
-ротацию токена из заголовков
-
-корректно обрабатывает 125002 / 125003
-
-использует полный XML schema для sms-list
-
-гарантирует доставку до удаления SMS
-
-📌 Файл размещается здесь:
-
-/opt/smsbridge/smsbridge.py
-
-sudo chown root:root /opt/smsbridge/smsbridge.py
+```bash
+sudo cp smsbridge.py /opt/smsbridge/smsbridge.py
 sudo chmod 755 /opt/smsbridge/smsbridge.py
+```
 
-6. Конфигурация окружения
-/etc/smsbridge.env
-# ModemMODEM_URL=http://192.168.8.1
+(The final script includes **all Huawei token handling, decoding fixes, and cleanup logic**.)
+
+---
+
+## Configuration
+
+### `/etc/smsbridge.env`
+
+```env
+# Modem
+MODEM_URL=http://192.168.8.1
 
 # Telegram
-TELEGRAM_BOT_TOKEN=123456:ABCDEF...
+TELEGRAM_BOT_TOKEN=123456:ABCDEF
 TELEGRAM_CHAT_ID=-1001234567890
 
-# Email (mail.ru SMTP)
+# Email (optional)
 EMAIL_TO=you@example.com
-EMAIL_FROM=you@mail.ru
+EMAIL_FROM=smsbridge@example.com
+
 SMTP_HOST=smtp.mail.ru
 SMTP_PORT=587
 SMTP_USER=you@mail.ru
-SMTP_PASS=APP_PASSWORD
+SMTP_PASS=app_password_here
 SMTP_TLS=yes
 
 # Polling
 COUNT_POLL_SECONDS=1
 POLL_INTERVAL_SECONDS=1
 
-# State
+# Storage
 STATE_DIR=/var/lib/smsbridge
+```
+
+Secure it:
+
+```bash
 sudo chown root:smsbridge /etc/smsbridge.env
 sudo chmod 640 /etc/smsbridge.env
+```
 
-7. systemd-сервис
-/etc/systemd/system/smsbridge.service
+---
+
+## systemd Service
+
+### `/etc/systemd/system/smsbridge.service`
+
+```ini
 [Unit]
-Description=Huawei HiLink SMS -> Telegram bridge (near real-time)
+Description=Huawei HiLink SMS Bridge
 Wants=network-online.target
 After=network-online.target
 
@@ -186,6 +229,7 @@ Group=smsbridge
 WorkingDirectory=/var/lib/smsbridge
 EnvironmentFile=/etc/smsbridge.env
 ExecStart=/opt/smsbridge/venv/bin/python /opt/smsbridge/smsbridge.py
+
 Restart=always
 RestartSec=5
 
@@ -195,25 +239,115 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/smsbridge
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
 PrivateNetwork=false
 
 [Install]
 WantedBy=multi-user.target
+```
 
-Активация
+---
+
+### Enable and start
+
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now smsbridge
+```
 
-8. Проверка и эксплуатация
-Логи
+---
+
+## Monitoring
+
+### Live logs
+
+```bash
 journalctl -u smsbridge -f -o cat
+```
 
+Expected behavior:
 
-Ожидаемое поведение:
-
+```text
 Huawei session initialized
 Modem LocalUnread=1
 Telegram delivered
 Email delivered
 Archived locally
-Processed SMS ... (deleted)
+Processed SMS (delivered+archived+deleted)
+Modem LocalUnread=0
+```
+
+---
+
+## Failure Semantics (IMPORTANT)
+
+The daemon guarantees:
+
+* ❌ SMS is **NOT deleted** if:
+
+  * Telegram delivery fails
+  * Email delivery fails
+  * Archive write fails
+* ✅ SMS is deleted **only after all deliveries succeed**
+* Token/session errors are retried safely
+* Duplicate SMS is avoided via **content fingerprinting**
+
+---
+
+## Local Storage
+
+```text
+/var/lib/smsbridge/
+├── processed_hashes.json   # Deduplication state
+└── sms_archive.jsonl       # Full SMS archive (JSON lines)
+```
+
+---
+
+## Security Notes
+
+* Runs as **unprivileged user**
+* No shell access
+* No modem exposure beyond `192.168.8.0/24`
+* systemd hardening enabled
+* Secrets stored only in root-owned env file
+
+---
+
+## Tested With
+
+* Debian 11 / 12
+* Huawei E3372h HiLink
+* SMS-only SIM
+* Telegram Bot API
+* SMTP mail.ru (STARTTLS)
+
+---
+
+## License
+
+MIT (or adapt as needed)
+
+---
+
+## Final Notes
+
+This project intentionally avoids:
+
+* Serial/AT mode
+* ModemManager
+* PPP / data connections
+* Default routing via USB modem
+
+It is designed specifically for **reliable SMS ingestion on headless Linux servers**.
+
+If you deploy this on a remote server, **always configure the network interface first**, or you risk locking yourself out.
+
+---
+
