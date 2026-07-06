@@ -1,0 +1,12 @@
+[Unit]
+Description=Check smsbridge modem polling heartbeat
+
+[Service]
+Type=oneshot
+User=smsbridge
+Group=smsbridge
+WorkingDirectory=/var/lib/smsbridge
+EnvironmentFile=/etc/smsbridge.env
+ExecStart=/opt/smsbridge/venv/bin/python /opt/smsbridge/smsbridge_healthcheck.py
+
+PrivateNetwork=false

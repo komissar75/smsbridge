@@ -2,104 +2,48 @@
 # -*- coding: utf-8 -*-
 
 """
-smsbridge.py — Huawei HiLink SMS → Telegram + Email (SMTP) bridge (Debian/systemd)
+Huawei HiLink SMS → Telegram + Email bridge.
 
-Key points for Huawei HiLink quirks (E3372h and similar):
-- Some firmware requires tokens from BOTH:
-    * /api/webserver/SesTokInfo  (TokInfo + SesInfo)
-    * /api/webserver/token       (one or more verification tokens)
-  especially for mutating endpoints like set-read / delete-sms.
-- Token can also rotate and be returned in HTTP response headers:
-    __RequestVerificationToken (or variants). We must capture and update it.
-
-Robustness:
-- Handles 125002/125003 as "session/token invalid" → full reinit and retry.
-- sms-list request uses full schema (prevents 100005 format error).
-
-Behavior:
-- Poll /api/sms/sms-count; when LocalUnread>0 fetch unread messages
-- Decode Cyrillic (mojibake + UCS-2 hex)
-- Send Telegram + Email (optional)
-- Archive locally
-- Then set-read + delete-sms
-- Dedup by fingerprint (sha256(phone|date|content)) since Index is reusable
+The daemon keeps normal SMS delivery separate from administrator alerting:
+- SMS delivery goes to the configured SMS recipient.
+- Administrator alerts go to a separate admin Telegram bot/chat and admin email.
+- Runtime modem/API failures are detected inside the daemon.
+- Startup/crash failures can be reported by smsbridge_alert.py through systemd OnFailure.
 """
 
 import hashlib
 import json
 import logging
 import os
-import smtplib
-import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
 import requests
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stdout,
-)
+from smsbridge_admin_alert import AdminAlerter
+from smsbridge_config import RuntimeConfig, load_config, validate_for_daemon
+from smsbridge_logging import setup_logging
+from smsbridge_notify import send_email_message, send_telegram_message
+from smsbridge_state import now_iso, write_json_atomic
+
+
 log = logging.getLogger("smsbridge")
 
-# -----------------------------
-# Config (env)
-# -----------------------------
-MODEM_URL = os.environ.get("MODEM_URL", "http://192.168.8.1").rstrip("/")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-EMAIL_TO = os.environ.get("EMAIL_TO")  # optional
-EMAIL_FROM = os.environ.get("EMAIL_FROM")
-EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "[SMSBridge]")
-
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.mail.ru")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASS = os.environ.get("SMTP_PASS")
-SMTP_TLS = os.environ.get("SMTP_TLS", "yes").lower() in ("1", "true", "yes", "y")
-
-COUNT_POLL_SECONDS = float(os.environ.get("COUNT_POLL_SECONDS", "1"))
-POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "1"))
-HTTP_TIMEOUT_SECONDS = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "5"))
-MAX_FETCH = int(os.environ.get("MAX_FETCH", "50"))
-
-STATE_DIR = os.environ.get("STATE_DIR", "/var/lib/smsbridge")
-PROCESSED_FILE = os.environ.get("PROCESSED_FILE", os.path.join(STATE_DIR, "processed_hashes.json"))
-ARCHIVE_FILE = os.environ.get("ARCHIVE_FILE", os.path.join(STATE_DIR, "sms_archive.jsonl"))
-
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    log.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-    sys.exit(2)
-
-if EMAIL_TO and not (SMTP_USER and SMTP_PASS):
-    log.error("EMAIL_TO is set but SMTP_USER/SMTP_PASS missing")
-    sys.exit(2)
-
-# -----------------------------
-# Huawei endpoints / codes
-# -----------------------------
 EP_INDEX_HTML = "/html/index.html"
 EP_SES_TOK = "/api/webserver/SesTokInfo"
 EP_WEB_TOKEN = "/api/webserver/token"
-
 EP_SMS_COUNT = "/api/sms/sms-count"
 EP_SMS_LIST = "/api/sms/sms-list"
 EP_SET_READ = "/api/sms/set-read"
 EP_DELETE_SMS = "/api/sms/delete-sms"
 
-HUAWEI_ERR_125002 = "125002"  # token invalid
-HUAWEI_ERR_125003 = "125003"  # session/token error
+HUAWEI_ERR_125002 = "125002"
+HUAWEI_ERR_125003 = "125003"
 
 
 @dataclass
@@ -108,22 +52,23 @@ class SmsMessage:
     phone: str
     content: str
     date: str
-    smstat: str  # "0" unread
+    smstat: str
 
 
-# -----------------------------
-# State / archive
-# -----------------------------
-def ensure_state_dir() -> None:
-    os.makedirs(STATE_DIR, exist_ok=True)
+class HuaweiSessionError(Exception):
+    """Token/session invalid -> reinit needed."""
 
 
-def load_processed_hashes() -> set:
-    ensure_state_dir()
+def ensure_state_dir(config: RuntimeConfig) -> None:
+    os.makedirs(config.state_dir, exist_ok=True)
+
+
+def load_processed_hashes(config: RuntimeConfig) -> set[str]:
+    ensure_state_dir(config)
     try:
-        if not os.path.exists(PROCESSED_FILE):
+        if not os.path.exists(config.processed_file):
             return set()
-        with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
+        with open(config.processed_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("hashes"), list):
             return set(str(x) for x in data["hashes"])
@@ -131,23 +76,17 @@ def load_processed_hashes() -> set:
             return set(str(x) for x in data)
         return set()
     except Exception as e:
-        log.warning("Failed to load processed state (%s): %s; starting empty", PROCESSED_FILE, e)
+        log.warning("Failed to load processed state (%s): %s; starting empty", config.processed_file, e)
         return set()
 
 
-def save_processed_hashes(hashes: set) -> None:
-    ensure_state_dir()
-    tmp = PROCESSED_FILE + ".tmp"
+def save_processed_hashes(config: RuntimeConfig, hashes: set[str]) -> None:
     payload = {"hashes": sorted(hashes)}
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, PROCESSED_FILE)
+    write_json_atomic(config.processed_file, payload)
 
 
-def append_archive(msg: SmsMessage, fp: str) -> None:
-    ensure_state_dir()
+def append_archive(config: RuntimeConfig, msg: SmsMessage, fp: str) -> None:
+    ensure_state_dir(config)
     rec = {
         "archived_at": datetime.now(timezone.utc).isoformat(),
         "fingerprint": fp,
@@ -157,15 +96,20 @@ def append_archive(msg: SmsMessage, fp: str) -> None:
         "content": msg.content,
         "smstat": msg.smstat,
     }
-    with open(ARCHIVE_FILE, "a", encoding="utf-8") as f:
+    with open(config.archive_file, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         f.flush()
         os.fsync(f.fileno())
 
 
-# -----------------------------
-# Content decoding
-# -----------------------------
+def write_health(config: RuntimeConfig, **updates: object) -> None:
+    payload = {
+        "updated_at": now_iso(),
+        **updates,
+    }
+    write_json_atomic(config.health_file, payload)
+
+
 def fix_mojibake_utf8(text: str) -> str:
     if not text:
         return ""
@@ -182,14 +126,11 @@ def decode_sms_content(text: str) -> str:
         return ""
     text = fix_mojibake_utf8(text)
     s = text.strip()
-
-    # UCS-2 hex (UTF-16BE)
     if len(s) >= 8 and (len(s) % 4 == 0) and all(c in "0123456789abcdefABCDEF" for c in s):
         try:
             return bytes.fromhex(s).decode("utf-16-be")
         except Exception:
             return text
-
     return text
 
 
@@ -198,54 +139,34 @@ def sms_fingerprint(msg: SmsMessage) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-# -----------------------------
-# XML helpers
-# -----------------------------
 def parse_xml_bytes(data: bytes) -> ET.Element:
     return ET.fromstring(data)
 
 
 def extract_error_code(root: ET.Element) -> Optional[str]:
     if root.tag.lower() == "error":
-        c = root.findtext("code")
-        return c.strip() if c else None
+        code = root.findtext("code")
+        return code.strip() if code else None
     err = root.find(".//error")
     if err is not None:
-        c = err.findtext("code")
-        return c.strip() if c else None
+        code = err.findtext("code")
+        return code.strip() if code else None
     return None
 
 
-class HuaweiSessionError(Exception):
-    """Token/session invalid -> reinit needed."""
-
-
-# -----------------------------
-# Huawei client
-# -----------------------------
 class HuaweiClient:
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, timeout: float, max_fetch: int):
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.max_fetch = max_fetch
         self.sess = requests.Session()
-
-        # The "current" verification token we send (some firmwares rotate it)
         self.token: Optional[str] = None
-
-        # Some firmwares also use additional tokens; we keep them if present
         self.token_alt: Optional[str] = None
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url + "/", path.lstrip("/"))
 
-    def _capture_token_from_headers(self, r: requests.Response) -> None:
-        """
-        Huawei may rotate token and return it in headers.
-        Observed header names:
-          - __RequestVerificationToken
-          - __RequestVerificationTokenone / two (rare)
-          - __requestverificationtoken (lowercase)
-        We'll store main token and keep an alternate if provided.
-        """
+    def _capture_token_from_headers(self, response: requests.Response) -> None:
         for key in (
             "__RequestVerificationToken",
             "__requestverificationtoken",
@@ -254,10 +175,9 @@ class HuaweiClient:
             "__RequestVerificationTokentwo",
             "__RequestVerificationTokenTwo",
         ):
-            val = r.headers.get(key)
-            if val and val.strip():
-                # If token string contains multiple tokens separated by '#', keep first as main
-                parts = [p for p in val.strip().split("#") if p]
+            value = response.headers.get(key)
+            if value and value.strip():
+                parts = [p for p in value.strip().split("#") if p]
                 if parts:
                     self.token = parts[0]
                     if len(parts) > 1:
@@ -265,23 +185,21 @@ class HuaweiClient:
                 return
 
     def _headers(self) -> Dict[str, str]:
-        h = {"Content-Type": "application/xml"}
+        headers = {"Content-Type": "application/xml"}
         if self.token:
-            h["__RequestVerificationToken"] = self.token
-        return h
+            headers["__RequestVerificationToken"] = self.token
+        return headers
 
     def _raise_if_session_error(self, code: Optional[str], where: str) -> None:
         if code in (HUAWEI_ERR_125002, HUAWEI_ERR_125003):
             raise HuaweiSessionError(f"{where} session/token error {code}")
 
     def init_session(self) -> None:
-        # 1) cookies
-        r1 = self.sess.get(self._url(EP_INDEX_HTML), timeout=HTTP_TIMEOUT_SECONDS)
+        r1 = self.sess.get(self._url(EP_INDEX_HTML), timeout=self.timeout)
         r1.raise_for_status()
         self._capture_token_from_headers(r1)
 
-        # 2) TokInfo token
-        r2 = self.sess.get(self._url(EP_SES_TOK), timeout=HTTP_TIMEOUT_SECONDS)
+        r2 = self.sess.get(self._url(EP_SES_TOK), timeout=self.timeout)
         r2.raise_for_status()
         self._capture_token_from_headers(r2)
 
@@ -290,41 +208,37 @@ class HuaweiClient:
         if code:
             raise RuntimeError(f"SesTokInfo returned error code {code}")
 
-        tok = root.findtext(".//TokInfo")
-        if tok and tok.strip():
-            self.token = tok.strip()
+        token = root.findtext(".//TokInfo")
+        if token and token.strip():
+            self.token = token.strip()
 
-        # 3) Additional webserver token(s) (needed on some firmware for set-read/delete)
-        r3 = self.sess.get(self._url(EP_WEB_TOKEN), timeout=HTTP_TIMEOUT_SECONDS)
+        r3 = self.sess.get(self._url(EP_WEB_TOKEN), timeout=self.timeout)
         r3.raise_for_status()
         self._capture_token_from_headers(r3)
 
         root3 = parse_xml_bytes(r3.content)
         code3 = extract_error_code(root3)
         if code3:
-            # don't fail hard; some firmwares may not support it
             log.info("webserver/token returned code=%s (ignored)", code3)
         else:
-            t = root3.findtext(".//token") or root3.findtext(".//Token")
-            if t and t.strip():
-                self.token = t.strip()
+            token3 = root3.findtext(".//token") or root3.findtext(".//Token")
+            if token3 and token3.strip():
+                self.token = token3.strip()
 
         if not self.token:
             raise RuntimeError("Failed to obtain verification token from modem")
-
         log.info("Huawei session initialized")
 
     def sms_count_unread(self) -> int:
-        r = self.sess.get(self._url(EP_SMS_COUNT), headers=self._headers(), timeout=HTTP_TIMEOUT_SECONDS)
-        r.raise_for_status()
-        self._capture_token_from_headers(r)
+        response = self.sess.get(self._url(EP_SMS_COUNT), headers=self._headers(), timeout=self.timeout)
+        response.raise_for_status()
+        self._capture_token_from_headers(response)
 
-        root = parse_xml_bytes(r.content)
+        root = parse_xml_bytes(response.content)
         code = extract_error_code(root)
         self._raise_if_session_error(code, "sms-count")
         if code:
             raise RuntimeError(f"sms-count returned error code {code}")
-
         unread = root.findtext(".//LocalUnread")
         if unread is None:
             raise RuntimeError("sms-count missing LocalUnread")
@@ -334,52 +248,46 @@ class HuaweiClient:
         body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <request>
   <PageIndex>1</PageIndex>
-  <ReadCount>{MAX_FETCH}</ReadCount>
+  <ReadCount>{self.max_fetch}</ReadCount>
   <BoxType>1</BoxType>
   <SortType>0</SortType>
   <Ascending>0</Ascending>
   <UnreadPreferred>1</UnreadPreferred>
 </request>"""
-
-        r = self.sess.post(
+        response = self.sess.post(
             self._url(EP_SMS_LIST),
             headers=self._headers(),
             data=body.encode("utf-8"),
-            timeout=HTTP_TIMEOUT_SECONDS,
+            timeout=self.timeout,
         )
-        r.raise_for_status()
-        self._capture_token_from_headers(r)
+        response.raise_for_status()
+        self._capture_token_from_headers(response)
 
-        root = parse_xml_bytes(r.content)
+        root = parse_xml_bytes(response.content)
         code = extract_error_code(root)
         self._raise_if_session_error(code, "sms-list")
         if code:
             raise RuntimeError(f"sms-list returned error code {code}")
 
-        msgs_node = root.find(".//Messages")
-        if msgs_node is None:
+        messages = root.find(".//Messages")
+        if messages is None:
             return []
 
         out: List[SmsMessage] = []
-        for m in msgs_node.findall(".//Message"):
-            smstat = (m.findtext("Smstat") or "").strip()
+        for node in messages.findall(".//Message"):
+            smstat = (node.findtext("Smstat") or "").strip()
             if smstat != "0":
                 continue
-            idx_txt = (m.findtext("Index") or "").strip()
             try:
-                idx = int(idx_txt)
+                index = int((node.findtext("Index") or "").strip())
             except Exception:
                 continue
-            phone = (m.findtext("Phone") or "").strip()
-            content_raw = (m.findtext("Content") or "").strip()
-            date = (m.findtext("Date") or "").strip()
-
             out.append(
                 SmsMessage(
-                    index=idx,
-                    phone=phone,
-                    content=decode_sms_content(content_raw),
-                    date=date,
+                    index=index,
+                    phone=(node.findtext("Phone") or "").strip(),
+                    content=decode_sms_content((node.findtext("Content") or "").strip()),
+                    date=(node.findtext("Date") or "").strip(),
                     smstat="0",
                 )
             )
@@ -387,45 +295,80 @@ class HuaweiClient:
 
     def set_read(self, index: int) -> None:
         body = f"""<?xml version="1.0" encoding="UTF-8"?><request><Index>{index}</Index></request>"""
-        r = self.sess.post(
+        response = self.sess.post(
             self._url(EP_SET_READ),
             headers=self._headers(),
             data=body.encode("utf-8"),
-            timeout=HTTP_TIMEOUT_SECONDS,
+            timeout=self.timeout,
         )
-        r.raise_for_status()
-        self._capture_token_from_headers(r)
-
-        root = parse_xml_bytes(r.content)
+        response.raise_for_status()
+        self._capture_token_from_headers(response)
+        root = parse_xml_bytes(response.content)
         code = extract_error_code(root)
         self._raise_if_session_error(code, "set-read")
         if code:
-            # Not fatal: some firmwares return codes when already-read
             log.info("set-read returned code=%s for index=%d (ignored)", code, index)
 
     def delete_sms(self, index: int) -> None:
         body = f"""<?xml version="1.0" encoding="UTF-8"?><request><Index>{index}</Index></request>"""
-        r = self.sess.post(
+        response = self.sess.post(
             self._url(EP_DELETE_SMS),
             headers=self._headers(),
             data=body.encode("utf-8"),
-            timeout=HTTP_TIMEOUT_SECONDS,
+            timeout=self.timeout,
         )
-        r.raise_for_status()
-        self._capture_token_from_headers(r)
-
-        root = parse_xml_bytes(r.content)
+        response.raise_for_status()
+        self._capture_token_from_headers(response)
+        root = parse_xml_bytes(response.content)
         code = extract_error_code(root)
         self._raise_if_session_error(code, "delete-sms")
         if code:
-            # Not fatal: may already be deleted
             log.info("delete-sms returned code=%s for index=%d (ignored)", code, index)
 
 
-# -----------------------------
-# Delivery: Telegram + Email
-# -----------------------------
-def send_telegram(msg: SmsMessage) -> None:
+class RuntimeHealth:
+    def __init__(self, config: RuntimeConfig, alerter: AdminAlerter, recent_log_lines):
+        self.config = config
+        self.alerter = alerter
+        self.recent_log_lines = recent_log_lines
+        self.consecutive_failures = 0
+        self.was_critical = False
+        self.last_error: Optional[str] = None
+        self.last_successful_modem_poll: Optional[str] = None
+
+    def success(self) -> None:
+        self.last_successful_modem_poll = now_iso()
+        write_health(
+            self.config,
+            last_successful_modem_poll=self.last_successful_modem_poll,
+            consecutive_failures=0,
+            last_error=None,
+        )
+        if self.was_critical:
+            self.alerter.recovery(recent_logs=list(self.recent_log_lines))
+        self.consecutive_failures = 0
+        self.was_critical = False
+        self.last_error = None
+
+    def failure(self, error: Exception) -> None:
+        self.consecutive_failures += 1
+        self.last_error = str(error)
+        write_health(
+            self.config,
+            last_successful_modem_poll=self.last_successful_modem_poll,
+            consecutive_failures=self.consecutive_failures,
+            last_error=self.last_error,
+        )
+        if self.consecutive_failures >= self.config.admin.after_consecutive_runtime_failures:
+            self.was_critical = True
+            self.alerter.runtime_critical(
+                self.consecutive_failures,
+                self.last_error,
+                recent_logs=list(self.recent_log_lines),
+            )
+
+
+def send_sms_telegram(config: RuntimeConfig, msg: SmsMessage) -> None:
     text = (
         "📩 SMS\n"
         f"From: {msg.phone}\n"
@@ -433,141 +376,140 @@ def send_telegram(msg: SmsMessage) -> None:
         f"Text: {msg.content}\n"
         f"Index: {msg.index}"
     )
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=HTTP_TIMEOUT_SECONDS)
-    r.raise_for_status()
+    send_telegram_message(
+        config.sms.telegram_bot_token,
+        config.sms.telegram_chat_id,
+        text,
+        timeout=config.http_timeout_seconds,
+    )
 
 
-def send_email_smtp(msg: SmsMessage) -> None:
-    if not EMAIL_TO:
+def send_sms_email(config: RuntimeConfig, msg: SmsMessage) -> None:
+    if not config.sms.email_to:
         return
-
-    subject = f"{EMAIL_SUBJECT_PREFIX} SMS from {msg.phone} @ {msg.date}"
+    subject = f"{config.sms.email_subject_prefix} SMS from {msg.phone} @ {msg.date}"
     body = f"From: {msg.phone}\nDate: {msg.date}\n\n{msg.content}\n\nIndex: {msg.index}\n"
-
-    em = EmailMessage()
-    em["To"] = EMAIL_TO
-    em["From"] = EMAIL_FROM or SMTP_USER
-    em["Subject"] = subject
-    em.set_content(body)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-        if SMTP_TLS:
-            s.starttls()
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(em)
+    send_email_message(config.sms.smtp, config.sms.email_to, subject, body, from_addr=config.sms.email_from)
 
 
-# -----------------------------
-# Main
-# -----------------------------
+def cleanup_modem_message(modem: HuaweiClient, msg: SmsMessage) -> bool:
+    for attempt in (1, 2):
+        try:
+            modem.set_read(msg.index)
+            modem.delete_sms(msg.index)
+            return True
+        except HuaweiSessionError as e:
+            log.warning("%s; reinitializing session (cleanup attempt %d)", e, attempt)
+            modem.init_session()
+    return False
+
+
 def main() -> int:
-    log.info("smsbridge starting (MODEM_URL=%s)", MODEM_URL)
+    config = load_config("/etc/smsbridge.env")
+    recent_handler = setup_logging(
+        config.log_file,
+        level_name=os.environ.get("LOG_LEVEL", "INFO"),
+        recent_lines=config.admin.log_lines,
+    )
 
-    processed = load_processed_hashes()
+    errors = validate_for_daemon(config)
+    if errors:
+        for error in errors:
+            log.error("Configuration error: %s", error)
+        AdminAlerter(config).systemd_failure("smsbridge.service", message="\n".join(errors), force=True)
+        return 2
+
+    log.info("smsbridge starting (MODEM_URL=%s)", config.modem_url)
+
+    processed = load_processed_hashes(config)
     log.info("Loaded %d processed fingerprints", len(processed))
 
-    modem = HuaweiClient(MODEM_URL)
+    alerter = AdminAlerter(config)
+    health = RuntimeHealth(config, alerter, recent_handler.lines)
+    modem = HuaweiClient(config.modem_url, config.http_timeout_seconds, config.max_fetch)
 
-    # Init modem session with retries
     while True:
         try:
             modem.init_session()
+            health.success()
             break
         except Exception as e:
             log.error("Failed to init modem session: %s; retrying in 5s", e)
+            health.failure(e)
             time.sleep(5)
 
     last_unread = -1
 
     while True:
         try:
-            # Count trigger
             try:
                 unread = modem.sms_count_unread()
             except HuaweiSessionError as e:
                 log.warning("%s; reinitializing session", e)
                 modem.init_session()
                 unread = modem.sms_count_unread()
+
+            health.success()
 
             if unread != last_unread:
                 log.info("Modem LocalUnread=%d", unread)
                 last_unread = unread
 
             if unread <= 0:
-                time.sleep(COUNT_POLL_SECONDS)
+                time.sleep(config.count_poll_seconds)
                 continue
 
-            # Fetch unread list
             try:
-                msgs = modem.sms_list_unread()
+                messages = modem.sms_list_unread()
             except HuaweiSessionError as e:
                 log.warning("%s; reinitializing session", e)
                 modem.init_session()
-                msgs = modem.sms_list_unread()
+                messages = modem.sms_list_unread()
 
-            if not msgs:
-                time.sleep(COUNT_POLL_SECONDS)
+            health.success()
+
+            if not messages:
+                time.sleep(config.count_poll_seconds)
                 continue
 
-            for msg in msgs:
+            for msg in messages:
                 fp = sms_fingerprint(msg)
 
-                # If already processed, attempt cleanup but don't fail the loop
                 if fp in processed:
-                    for attempt in (1, 2):
-                        try:
-                            modem.set_read(msg.index)
-                            modem.delete_sms(msg.index)
-                            break
-                        except HuaweiSessionError as e:
-                            log.warning("%s; reinitializing session (cleanup attempt %d)", e, attempt)
-                            modem.init_session()
+                    cleanup_modem_message(modem, msg)
                     continue
 
-                # Delivery guarantee: do not delete if delivery fails
                 try:
-                    send_telegram(msg)
+                    send_sms_telegram(config, msg)
                     log.info("Telegram delivered (fp=%s...)", fp[:8])
 
-                    send_email_smtp(msg)
-                    if EMAIL_TO:
-                        log.info("Email delivered to %s (fp=%s...)", EMAIL_TO, fp[:8])
+                    send_sms_email(config, msg)
+                    if config.sms.email_to:
+                        log.info("Email delivered to SMS recipient (fp=%s...)", fp[:8])
 
-                    append_archive(msg, fp)
+                    append_archive(config, msg, fp)
                     log.info("Archived locally (fp=%s...)", fp[:8])
                 except Exception as e:
                     log.error("Delivery failed; SMS will NOT be deleted. fp=%s... err=%s", fp[:8], e)
                     continue
 
-                # Cleanup modem with retry on session/token errors
-                cleaned = False
-                for attempt in (1, 2):
-                    try:
-                        modem.set_read(msg.index)
-                        modem.delete_sms(msg.index)
-                        cleaned = True
-                        break
-                    except HuaweiSessionError as e:
-                        log.warning("%s; reinitializing session (cleanup attempt %d)", e, attempt)
-                        modem.init_session()
-
-                if not cleaned:
+                if not cleanup_modem_message(modem, msg):
                     log.error("Cleanup failed after retries; message delivered but NOT deleted. fp=%s...", fp[:8])
-                    # Do NOT mark as processed so it can be retried/cleaned later (or handled manually)
                     continue
 
                 processed.add(fp)
-                save_processed_hashes(processed)
+                save_processed_hashes(config, processed)
                 log.info("Processed SMS fp=%s... index=%d (delivered+archived+deleted)", fp[:8], msg.index)
 
-            time.sleep(POLL_INTERVAL_SECONDS)
+            time.sleep(config.poll_interval_seconds)
 
         except requests.RequestException as e:
-            log.error("Network error: %s; sleeping 5s", e)
+            log.error("Network error while polling modem: %s; sleeping 5s", e)
+            health.failure(e)
             time.sleep(5)
         except Exception as e:
             log.exception("Unexpected loop error: %s; sleeping 5s", e)
+            health.failure(e)
             time.sleep(5)
 
 

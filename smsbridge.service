@@ -1,0 +1,39 @@
+[Unit]
+Description=Huawei HiLink SMS -> Telegram/Email bridge
+Wants=network-online.target
+After=network-online.target
+OnFailure=smsbridge-alert@%n.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=smsbridge
+Group=smsbridge
+WorkingDirectory=/var/lib/smsbridge
+EnvironmentFile=/etc/smsbridge.env
+
+ExecStart=/opt/smsbridge/venv/bin/python /opt/smsbridge/smsbridge.py
+
+Restart=always
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/smsbridge /var/log/smsbridge
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+
+# Networking is needed for Huawei modem, Telegram and SMTP.
+PrivateNetwork=false
+
+[Install]
+WantedBy=multi-user.target

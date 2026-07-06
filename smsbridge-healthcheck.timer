@@ -1,0 +1,11 @@
+[Unit]
+Description=Run smsbridge healthcheck periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+AccuracySec=30s
+Unit=smsbridge-healthcheck.service
+
+[Install]
+WantedBy=timers.target

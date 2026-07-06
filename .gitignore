@@ -1,0 +1,17 @@
+.env
+*.env
+!smsbridge.env.example
+smsbridge.env
+cookies.txt
+*.cookie
+*.cookies
+sms_archive.jsonl
+processed_hashes.json
+processed_indexes.json
+alert_state.json
+health.json
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/

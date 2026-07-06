@@ -1,0 +1,13 @@
+[Unit]
+Description=Send smsbridge administrator alert for failed %i
+
+[Service]
+Type=oneshot
+User=smsbridge
+Group=smsbridge
+WorkingDirectory=/var/lib/smsbridge
+EnvironmentFile=/etc/smsbridge.env
+ExecStart=/opt/smsbridge/venv/bin/python /opt/smsbridge/smsbridge_alert.py --source systemd --unit %i
+
+# Alert delivery needs network access.
+PrivateNetwork=false
